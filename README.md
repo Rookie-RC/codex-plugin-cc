@@ -161,6 +161,7 @@ Ask Codex to redesign the database connection to be more resilient.
 - if you do not pass `--model` or `--effort`, Codex chooses its own defaults.
 - if you say `spark`, the plugin maps that to `gpt-5.3-codex-spark`
 - follow-up rescue requests can continue the latest Codex task in the repo
+- rescue runs use the `danger-full-access` sandbox by default. See [Sandbox Mode](#sandbox-mode) for what that means and how to override it.
 
 ### `/codex:transfer`
 
@@ -267,6 +268,45 @@ Then check in with:
 ## Codex Integration
 
 The Codex plugin wraps the [Codex app server](https://developers.openai.com/codex/app-server). It uses the global `codex` binary installed in your environment and [applies the same configuration](https://developers.openai.com/codex/config-basic).
+
+### Sandbox Mode
+
+Rescue tasks (`/codex:rescue`) run with the `danger-full-access` sandbox by default. This fork defaults to it because HPC systems such as JULES cannot use Codex's Linux bubblewrap sandbox. With `danger-full-access`, Codex neither builds a `bwrap` sandbox nor runs its startup `bwrap` capability probe for rescue runs.
+
+The same mode is applied to both `thread/start` and `thread/resume`, so a continued rescue session keeps the sandbox it started with.
+
+Override it with `CODEX_COMPANION_SANDBOX`:
+
+```bash
+CODEX_COMPANION_SANDBOX=read-only claude
+CODEX_COMPANION_SANDBOX=workspace-write claude
+CODEX_COMPANION_SANDBOX=danger-full-access claude
+```
+
+Accepted values are `read-only`, `workspace-write`, and `danger-full-access`. Anything else fails with `Unsupported sandbox mode`.
+
+The plugin also pins the resolved mode as the app-server process default, so the override wins over `sandbox_mode` from your Codex config for plugin runs.
+
+> [!IMPORTANT]
+> With the default `danger-full-access` mode, `--write` is a behavioral contract, not an OS-enforced one:
+>
+> - `--write` means Codex is allowed to modify the workspace.
+> - without `--write`, Codex is *instructed* to stay read-only (a `<read_only_mode>` block is appended to the prompt) and is no longer constrained by the OS. That is a strong instruction, not a hard boundary.
+> - set `CODEX_COMPANION_SANDBOX=read-only` to get the old, OS-enforced read-only behavior back (the prompt instruction is then omitted, because the sandbox enforces it).
+>
+> `/codex:review` and `/codex:adversarial-review` are unaffected: they keep using the enforced `read-only` sandbox, so on hosts where `bwrap` is unusable those review paths can still fail.
+
+To confirm the behavior on an HPC host:
+
+```bash
+# 1. Is bubblewrap usable here at all?
+bwrap --unshare-user --unshare-net --ro-bind / / /bin/true; echo "bwrap exit=$?"
+
+# 2. Run a rescue task through the plugin and check the reported sandbox mode.
+node "${CLAUDE_PLUGIN_ROOT}/scripts/codex-companion.mjs" task --json \
+  "Use the shell tool to run exactly: echo probe. Then reply with only its stdout."
+# -> "sandbox": "danger-full-access" and no bubblewrap errors
+```
 
 ### Common Configurations
 

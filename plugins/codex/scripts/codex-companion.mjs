@@ -52,6 +52,7 @@ import {
   runTrackedJob,
   SESSION_ID_ENV
 } from "./lib/tracked-jobs.mjs";
+import { resolveSandboxMode } from "./lib/sandbox.mjs";
 import { resolveWorkspaceRoot } from "./lib/workspace.mjs";
 import {
   renderNativeReviewResult,
@@ -71,6 +72,19 @@ const DEFAULT_STATUS_POLL_INTERVAL_MS = 2000;
 const VALID_REASONING_EFFORTS = new Set(["none", "minimal", "low", "medium", "high", "xhigh"]);
 const MODEL_ALIASES = new Map([["spark", "gpt-5.3-codex-spark"]]);
 const STOP_REVIEW_TASK_MARKER = "Run a stop-gate review of the previous Claude turn.";
+/**
+ * Prepended to non-write rescue prompts when Codex is not running under the
+ * OS-enforced `read-only` sandbox, so `--write` keeps its behavioral meaning.
+ * It goes first so prompt templates that end in an output contract (for example
+ * the stop-gate review) keep their contract as the last instruction.
+ */
+const READ_ONLY_TASK_INSTRUCTION = [
+  "<read_only_mode>",
+  "This rescue run is read-only: investigate, diagnose, and report only.",
+  "Do not edit, create, or delete files, and do not run commands that write to the repository.",
+  "Describe the changes you would make instead of applying them.",
+  "</read_only_mode>"
+].join("\n");
 
 function printUsage() {
   console.log(
@@ -458,6 +472,17 @@ async function executeReviewRun(request) {
 }
 
 
+function applyReadOnlyTaskInstruction(prompt, { write, sandbox }) {
+  if (write || sandbox === "read-only") {
+    return prompt;
+  }
+  const base = String(prompt ?? "").trim();
+  if (!base) {
+    return prompt;
+  }
+  return `${READ_ONLY_TASK_INSTRUCTION}\n\n${base}`;
+}
+
 async function executeTaskRun(request) {
   const workspaceRoot = resolveWorkspaceRoot(request.cwd);
   ensureCodexAvailable(request.cwd);
@@ -482,13 +507,18 @@ async function executeTaskRun(request) {
     throw new Error("Provide a prompt, a prompt file, piped stdin, or use --resume-last.");
   }
 
+  const write = Boolean(request.write);
+  const sandbox = request.sandbox ?? resolveSandboxMode();
+
   const result = await runAppServerTurn(workspaceRoot, {
     resumeThreadId,
-    prompt: request.prompt,
-    defaultPrompt: resumeThreadId ? DEFAULT_CONTINUE_PROMPT : "",
+    prompt: applyReadOnlyTaskInstruction(request.prompt, { write, sandbox }),
+    defaultPrompt: resumeThreadId
+      ? applyReadOnlyTaskInstruction(DEFAULT_CONTINUE_PROMPT, { write, sandbox })
+      : "",
     model: request.model,
     effort: request.effort,
-    sandbox: request.write ? "workspace-write" : "read-only",
+    sandbox,
     onProgress: request.onProgress,
     persistThread: true,
     threadName: resumeThreadId ? null : buildPersistentTaskThreadName(request.prompt || DEFAULT_CONTINUE_PROMPT)
@@ -505,12 +535,13 @@ async function executeTaskRun(request) {
     {
       title: taskMetadata.title,
       jobId: request.jobId ?? null,
-      write: Boolean(request.write)
+      write
     }
   );
   const payload = {
     status: result.status,
     threadId: result.threadId,
+    sandbox,
     rawOutput,
     touchedFiles: result.touchedFiles,
     reasoningSummary: result.reasoningSummary
@@ -525,7 +556,7 @@ async function executeTaskRun(request) {
     summary: firstMeaningfulLine(rawOutput, firstMeaningfulLine(failureMessage, `${taskMetadata.title} finished.`)),
     jobTitle: taskMetadata.title,
     jobClass: "task",
-    write: Boolean(request.write)
+    write
   };
 }
 
@@ -601,11 +632,12 @@ function buildTaskJob(workspaceRoot, taskMetadata, write) {
   });
 }
 
-function buildTaskRequest({ cwd, model, effort, prompt, write, resumeLast, jobId }) {
+function buildTaskRequest({ cwd, model, effort, sandbox, prompt, write, resumeLast, jobId }) {
   return {
     cwd,
     model,
     effort,
+    sandbox,
     prompt,
     write,
     resumeLast,
@@ -780,6 +812,9 @@ async function handleTask(argv) {
     throw new Error("Choose either --resume/--resume-last or --fresh.");
   }
   const write = Boolean(options.write);
+  // Resolve (and validate) the sandbox mode before enqueuing so a bad override
+  // fails fast instead of failing later inside a detached worker.
+  const sandbox = resolveSandboxMode();
   const taskMetadata = buildTaskRunMetadata({
     prompt,
     resumeLast
@@ -794,6 +829,7 @@ async function handleTask(argv) {
       cwd,
       model,
       effort,
+      sandbox,
       prompt,
       write,
       resumeLast,
@@ -812,6 +848,7 @@ async function handleTask(argv) {
         cwd,
         model,
         effort,
+        sandbox,
         prompt,
         write,
         resumeLast,

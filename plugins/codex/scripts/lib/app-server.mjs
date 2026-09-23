@@ -15,6 +15,7 @@ import readline from "node:readline";
 import { parseBrokerEndpoint } from "./broker-endpoint.mjs";
 import { ensureBrokerSession, loadBrokerSession } from "./broker-lifecycle.mjs";
 import { terminateProcessTree } from "./process.mjs";
+import { resolveSandboxMode, sandboxModeConfigArgs } from "./sandbox.mjs";
 
 const PLUGIN_MANIFEST_URL = new URL("../../.claude-plugin/plugin.json", import.meta.url);
 const PLUGIN_MANIFEST = JSON.parse(fs.readFileSync(PLUGIN_MANIFEST_URL, "utf8"));
@@ -187,7 +188,11 @@ class SpawnedCodexAppServerClient extends AppServerClientBase {
   }
 
   async initialize() {
-    this.proc = spawn("codex", ["app-server"], {
+    // Pin the process-level default sandbox mode. Codex probes bubblewrap once
+    // per process when that default needs a platform sandbox, so this keeps the
+    // probe from running on hosts where bubblewrap is unusable.
+    const sandboxArgs = sandboxModeConfigArgs(resolveSandboxMode(this.options.env));
+    this.proc = spawn("codex", ["app-server", ...sandboxArgs], {
       cwd: this.cwd,
       env: this.options.env ?? process.env,
       stdio: ["pipe", "pipe", "pipe"],

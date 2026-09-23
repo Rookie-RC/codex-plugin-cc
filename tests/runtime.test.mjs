@@ -8,6 +8,11 @@ import { fileURLToPath } from "node:url";
 import { buildEnv, installFakeCodex } from "./fake-codex-fixture.mjs";
 import { initGitRepo, makeTempDir, run } from "./helpers.mjs";
 import { loadBrokerSession, saveBrokerSession } from "../plugins/codex/scripts/lib/broker-lifecycle.mjs";
+import {
+  DEFAULT_SANDBOX_MODE,
+  normalizeSandboxMode,
+  resolveSandboxMode
+} from "../plugins/codex/scripts/lib/sandbox.mjs";
 import { resolveStateDir } from "../plugins/codex/scripts/lib/state.mjs";
 
 const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
@@ -611,7 +616,7 @@ test("task --resume-last does not resume a task from another Claude session", ()
 
   const fakeState = JSON.parse(fs.readFileSync(statePath, "utf8"));
   assert.equal(fakeState.lastTurnStart.threadId, "thr_1");
-  assert.equal(fakeState.lastTurnStart.prompt, "initial task");
+  assert.match(fakeState.lastTurnStart.prompt, /initial task/);
 });
 
 test("task --resume-last ignores running tasks from other Claude sessions", () => {
@@ -740,7 +745,7 @@ test("task --resume acts like --resume-last without leaking the flag into the pr
   assert.equal(result.status, 0, result.stderr);
   const fakeState = JSON.parse(fs.readFileSync(statePath, "utf8"));
   assert.equal(fakeState.lastTurnStart.threadId, "thr_1");
-  assert.equal(fakeState.lastTurnStart.prompt, "follow up");
+  assert.match(fakeState.lastTurnStart.prompt, /follow up/);
 });
 
 test("task --fresh is treated as routing control and does not leak into the prompt", () => {
@@ -760,7 +765,7 @@ test("task --fresh is treated as routing control and does not leak into the prom
 
   assert.equal(result.status, 0, result.stderr);
   const fakeState = JSON.parse(fs.readFileSync(statePath, "utf8"));
-  assert.equal(fakeState.lastTurnStart.prompt, "diagnose the flaky test");
+  assert.match(fakeState.lastTurnStart.prompt, /diagnose the flaky test/);
 });
 
 test("task forwards model selection and reasoning effort to app-server turn/start", () => {
@@ -782,6 +787,263 @@ test("task forwards model selection and reasoning effort to app-server turn/star
   const fakeState = JSON.parse(fs.readFileSync(statePath, "utf8"));
   assert.equal(fakeState.lastTurnStart.model, "gpt-5.3-codex-spark");
   assert.equal(fakeState.lastTurnStart.effort, "low");
+});
+
+test("app-server is spawned with the configured default sandbox mode", () => {
+  const repo = makeTempDir();
+  const binDir = makeTempDir();
+  const statePath = path.join(binDir, "fake-codex-state.json");
+  installFakeCodex(binDir);
+  initGitRepo(repo);
+
+  const result = run("node", [SCRIPT, "setup", "--json"], {
+    cwd: repo,
+    env: buildEnv(binDir)
+  });
+
+  assert.equal(result.status, 0, result.stderr);
+  const fakeState = JSON.parse(fs.readFileSync(statePath, "utf8"));
+  assert.deepEqual(fakeState.appServerArgs, ["app-server", "-c", 'sandbox_mode="danger-full-access"']);
+});
+
+test("app-server honors CODEX_COMPANION_SANDBOX at startup, including through the broker", () => {
+  const repo = makeTempDir();
+  const binDir = makeTempDir();
+  const statePath = path.join(binDir, "fake-codex-state.json");
+  installFakeCodex(binDir);
+  initGitRepo(repo);
+  fs.writeFileSync(path.join(repo, "README.md"), "hello\n");
+  run("git", ["add", "README.md"], { cwd: repo });
+  run("git", ["commit", "-m", "init"], { cwd: repo });
+
+  // `task` connects through the shared broker, which starts the app-server with
+  // the same client and therefore the same sandbox override.
+  const result = run("node", [SCRIPT, "task", "investigate the failing test"], {
+    cwd: repo,
+    env: {
+      ...buildEnv(binDir),
+      CODEX_COMPANION_SANDBOX: "workspace-write"
+    }
+  });
+
+  assert.equal(result.status, 0, result.stderr);
+  const fakeState = JSON.parse(fs.readFileSync(statePath, "utf8"));
+  assert.ok(fakeState.appServerStarts >= 1);
+  assert.deepEqual(fakeState.appServerArgs, ["app-server", "-c", 'sandbox_mode="workspace-write"']);
+  assert.equal(fakeState.lastThreadStart.sandbox, "workspace-write");
+});
+
+test("normalizeSandboxMode accepts the Codex sandbox modes and rejects anything else", () => {
+  assert.equal(normalizeSandboxMode("danger-full-access"), "danger-full-access");
+  assert.equal(normalizeSandboxMode("  DANGER_FULL_ACCESS "), "danger-full-access");
+  assert.equal(normalizeSandboxMode("read_only"), "read-only");
+  assert.equal(normalizeSandboxMode("Workspace-Write"), "workspace-write");
+  assert.equal(normalizeSandboxMode(""), null);
+  assert.equal(normalizeSandboxMode(undefined), null);
+  assert.throws(() => normalizeSandboxMode("yolo"), /Unsupported sandbox mode "yolo".*CODEX_COMPANION_SANDBOX/s);
+});
+
+test("resolveSandboxMode defaults to danger-full-access and honors the override", () => {
+  assert.equal(DEFAULT_SANDBOX_MODE, "danger-full-access");
+  assert.equal(resolveSandboxMode({}), "danger-full-access");
+  assert.equal(resolveSandboxMode({ CODEX_COMPANION_SANDBOX: "  " }), "danger-full-access");
+  assert.equal(resolveSandboxMode({ CODEX_COMPANION_SANDBOX: "workspace-write" }), "workspace-write");
+  assert.equal(resolveSandboxMode({ CODEX_COMPANION_SANDBOX: "read-only" }), "read-only");
+});
+
+test("task defaults rescue thread/start to the danger-full-access sandbox", () => {
+  const repo = makeTempDir();
+  const binDir = makeTempDir();
+  const statePath = path.join(binDir, "fake-codex-state.json");
+  installFakeCodex(binDir);
+  initGitRepo(repo);
+  fs.writeFileSync(path.join(repo, "README.md"), "hello\n");
+  run("git", ["add", "README.md"], { cwd: repo });
+  run("git", ["commit", "-m", "init"], { cwd: repo });
+
+  const result = run("node", [SCRIPT, "task", "investigate the failing test"], {
+    cwd: repo,
+    env: buildEnv(binDir)
+  });
+
+  assert.equal(result.status, 0, result.stderr);
+  const fakeState = JSON.parse(fs.readFileSync(statePath, "utf8"));
+  assert.equal(fakeState.lastThreadStart.sandbox, "danger-full-access");
+  assert.equal(fakeState.lastThreadStart.ephemeral, false);
+});
+
+test("task --write also uses danger-full-access and skips the read-only instruction", () => {
+  const repo = makeTempDir();
+  const binDir = makeTempDir();
+  const statePath = path.join(binDir, "fake-codex-state.json");
+  installFakeCodex(binDir);
+  initGitRepo(repo);
+  fs.writeFileSync(path.join(repo, "README.md"), "hello\n");
+  run("git", ["add", "README.md"], { cwd: repo });
+  run("git", ["commit", "-m", "init"], { cwd: repo });
+
+  const result = run("node", [SCRIPT, "task", "--write", "fix the failing test"], {
+    cwd: repo,
+    env: buildEnv(binDir)
+  });
+
+  assert.equal(result.status, 0, result.stderr);
+  const fakeState = JSON.parse(fs.readFileSync(statePath, "utf8"));
+  assert.equal(fakeState.lastThreadStart.sandbox, "danger-full-access");
+  assert.equal(fakeState.lastTurnStart.prompt, "fix the failing test");
+  assert.doesNotMatch(fakeState.lastTurnStart.prompt, /<read_only_mode>/);
+});
+
+test("non-write rescue prompts Codex to stay read-only because the sandbox does not enforce it", () => {
+  const repo = makeTempDir();
+  const binDir = makeTempDir();
+  const statePath = path.join(binDir, "fake-codex-state.json");
+  installFakeCodex(binDir);
+  initGitRepo(repo);
+  fs.writeFileSync(path.join(repo, "README.md"), "hello\n");
+  run("git", ["add", "README.md"], { cwd: repo });
+  run("git", ["commit", "-m", "init"], { cwd: repo });
+
+  const result = run("node", [SCRIPT, "task", "investigate the failing test"], {
+    cwd: repo,
+    env: buildEnv(binDir)
+  });
+
+  assert.equal(result.status, 0, result.stderr);
+  const fakeState = JSON.parse(fs.readFileSync(statePath, "utf8"));
+  assert.match(fakeState.lastTurnStart.prompt, /investigate the failing test/);
+  assert.match(fakeState.lastTurnStart.prompt, /<read_only_mode>/);
+  assert.match(fakeState.lastTurnStart.prompt, /Do not edit, create, or delete files/);
+  // Prepended, so prompt templates keep their trailing output contract last.
+  assert.match(fakeState.lastTurnStart.prompt, /^<read_only_mode>/);
+});
+
+test("CODEX_COMPANION_SANDBOX=read-only restores the enforced sandbox without the prompt instruction", () => {
+  const repo = makeTempDir();
+  const binDir = makeTempDir();
+  const statePath = path.join(binDir, "fake-codex-state.json");
+  installFakeCodex(binDir);
+  initGitRepo(repo);
+  fs.writeFileSync(path.join(repo, "README.md"), "hello\n");
+  run("git", ["add", "README.md"], { cwd: repo });
+  run("git", ["commit", "-m", "init"], { cwd: repo });
+
+  const result = run("node", [SCRIPT, "task", "investigate the failing test"], {
+    cwd: repo,
+    env: {
+      ...buildEnv(binDir),
+      CODEX_COMPANION_SANDBOX: "read-only"
+    }
+  });
+
+  assert.equal(result.status, 0, result.stderr);
+  const fakeState = JSON.parse(fs.readFileSync(statePath, "utf8"));
+  assert.equal(fakeState.lastThreadStart.sandbox, "read-only");
+  assert.equal(fakeState.lastTurnStart.prompt, "investigate the failing test");
+});
+
+test("CODEX_COMPANION_SANDBOX overrides the sandbox for thread/start and thread/resume", () => {
+  const repo = makeTempDir();
+  const binDir = makeTempDir();
+  const statePath = path.join(binDir, "fake-codex-state.json");
+  installFakeCodex(binDir);
+  initGitRepo(repo);
+  fs.writeFileSync(path.join(repo, "README.md"), "hello\n");
+  run("git", ["add", "README.md"], { cwd: repo });
+  run("git", ["commit", "-m", "init"], { cwd: repo });
+
+  const env = {
+    ...buildEnv(binDir),
+    CODEX_COMPANION_SANDBOX: "workspace-write"
+  };
+
+  const firstRun = run("node", [SCRIPT, "task", "initial task"], { cwd: repo, env });
+  assert.equal(firstRun.status, 0, firstRun.stderr);
+  assert.equal(JSON.parse(fs.readFileSync(statePath, "utf8")).lastThreadStart.sandbox, "workspace-write");
+
+  const resumeRun = run("node", [SCRIPT, "task", "--resume-last", "follow up"], { cwd: repo, env });
+  assert.equal(resumeRun.status, 0, resumeRun.stderr);
+  const resumedState = JSON.parse(fs.readFileSync(statePath, "utf8"));
+  assert.equal(resumedState.lastThreadResume.sandbox, "workspace-write");
+  assert.match(resumedState.lastTurnStart.prompt, /follow up/);
+  assert.match(resumedState.lastTurnStart.prompt, /<read_only_mode>/);
+});
+
+test("task keeps the default sandbox mode when resuming a rescue thread", () => {
+  const repo = makeTempDir();
+  const binDir = makeTempDir();
+  const statePath = path.join(binDir, "fake-codex-state.json");
+  installFakeCodex(binDir);
+  initGitRepo(repo);
+  fs.writeFileSync(path.join(repo, "README.md"), "hello\n");
+  run("git", ["add", "README.md"], { cwd: repo });
+  run("git", ["commit", "-m", "init"], { cwd: repo });
+
+  const firstRun = run("node", [SCRIPT, "task", "initial task"], {
+    cwd: repo,
+    env: buildEnv(binDir)
+  });
+  assert.equal(firstRun.status, 0, firstRun.stderr);
+  assert.equal(JSON.parse(fs.readFileSync(statePath, "utf8")).lastThreadStart.sandbox, "danger-full-access");
+
+  const resumeRun = run("node", [SCRIPT, "task", "--resume-last", "follow up"], {
+    cwd: repo,
+    env: buildEnv(binDir)
+  });
+
+  assert.equal(resumeRun.status, 0, resumeRun.stderr);
+  const fakeState = JSON.parse(fs.readFileSync(statePath, "utf8"));
+  assert.equal(fakeState.lastThreadResume.sandbox, "danger-full-access");
+  assert.equal(fakeState.lastThreadResume.threadId, fakeState.lastTurnStart.threadId);
+});
+
+test("task rejects an unsupported CODEX_COMPANION_SANDBOX value before starting Codex", () => {
+  const repo = makeTempDir();
+  const binDir = makeTempDir();
+  installFakeCodex(binDir);
+  initGitRepo(repo);
+  fs.writeFileSync(path.join(repo, "README.md"), "hello\n");
+  run("git", ["add", "README.md"], { cwd: repo });
+  run("git", ["commit", "-m", "init"], { cwd: repo });
+
+  const result = run("node", [SCRIPT, "task", "investigate the failing test"], {
+    cwd: repo,
+    env: {
+      ...buildEnv(binDir),
+      CODEX_COMPANION_SANDBOX: "yolo"
+    }
+  });
+
+  assert.equal(result.status, 1);
+  assert.match(result.stderr, /Unsupported sandbox mode "yolo"/);
+  assert.match(result.stderr, /read-only, workspace-write, danger-full-access/);
+});
+
+test("review and adversarial review keep the enforced read-only sandbox", () => {
+  const repo = makeTempDir();
+  const binDir = makeTempDir();
+  const statePath = path.join(binDir, "fake-codex-state.json");
+  installFakeCodex(binDir);
+  initGitRepo(repo);
+  fs.mkdirSync(path.join(repo, "src"));
+  fs.writeFileSync(path.join(repo, "src", "app.js"), "export const value = 1;\n");
+  run("git", ["add", "src/app.js"], { cwd: repo });
+  run("git", ["commit", "-m", "init"], { cwd: repo });
+  fs.writeFileSync(path.join(repo, "src", "app.js"), "export const value = 2;\n");
+
+  const review = run("node", [SCRIPT, "review"], {
+    cwd: repo,
+    env: buildEnv(binDir)
+  });
+  assert.equal(review.status, 0, review.stderr);
+  assert.equal(JSON.parse(fs.readFileSync(statePath, "utf8")).lastThreadStart.sandbox, "read-only");
+
+  const adversarial = run("node", [SCRIPT, "adversarial-review"], {
+    cwd: repo,
+    env: buildEnv(binDir)
+  });
+  assert.equal(adversarial.status, 0, adversarial.stderr);
+  assert.equal(JSON.parse(fs.readFileSync(statePath, "utf8")).lastThreadStart.sandbox, "read-only");
 });
 
 test("task logs reasoning summaries and assistant messages to the job log", () => {

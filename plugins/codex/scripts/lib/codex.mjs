@@ -1100,12 +1100,14 @@ export async function runAppServerTurn(cwd, options = {}) {
 
   return withAppServer(cwd, async (client) => {
     let threadId;
+    // Resolve once so `thread/start` and `thread/resume` always agree.
+    const sandbox = options.sandbox ?? "read-only";
 
     if (options.resumeThreadId) {
       emitProgress(options.onProgress, `Resuming thread ${options.resumeThreadId}.`, "starting");
       const response = await resumeThread(client, options.resumeThreadId, cwd, {
         model: options.model,
-        sandbox: options.sandbox,
+        sandbox,
         ephemeral: false
       });
       threadId = response.thread.id;
@@ -1113,7 +1115,7 @@ export async function runAppServerTurn(cwd, options = {}) {
       emitProgress(options.onProgress, "Starting Codex task thread.", "starting");
       const response = await startThread(client, cwd, {
         model: options.model,
-        sandbox: options.sandbox,
+        sandbox,
         ephemeral: options.persistThread ? false : true,
         threadName: options.persistThread ? options.threadName : options.threadName ?? null
       });
